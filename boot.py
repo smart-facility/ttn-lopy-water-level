@@ -10,10 +10,6 @@ import pycom
 import os
 from network import WLAN
 
-NANO_GATEWAY = False          # is the lopy joining a TTN nano gateway
-MAX_JOIN_ATTEMPT = 50         # max number of connection attemps to TTN
-INT_SAMPLING = 1000 * 60 * 15 # sampling interval
-
 # deactivate wifi
 wlan = WLAN()
 wlan.deinit()

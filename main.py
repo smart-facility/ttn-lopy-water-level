@@ -3,61 +3,51 @@
 # Main script
 #
 # Author:  J. Barthelemy
-# Version: 10 July 2017
+# Version: 28 August 2017
 
 import time
 import socket
 import binascii
 import struct
-import pycom
 import config
-from machine import ADC, Pin, deepsleep
+import gc
+from machine import ADC, Pin, UART
 from network import LoRa
+from deepsleep import DeepSleep
 
-# setting up the pins to start/stop the sensor
-# ... Pin 19 is pulled down and is set to be an output
+# enabling garbage collector
+gc.enable()
+
+# setting up the pin 19 to start/stop the sensor (Pulled down, output)
 pin_activation_sensor = Pin('P19', mode=Pin.OUT, pull=Pin.PULL_DOWN)
 
-# setting up the Analog/Digital Converter with 10 bits for the ultrasonic sensor
-adc = ADC(bits=10)
-# create an analog pin on P20
+# setting up the Analog/Digital Converter with 12 bits
+adc = ADC(bits=12)
+
+# create an analog pin on P20 for the ultrasonic sensor
 apin = adc.channel(pin='P20', attn=ADC.ATTN_11DB)
 
-def read_distance():
-    '''Reading distance using the ultrasonic sensor'''
+# create an analog pin on P16 for the battery voltage
+batt = adc.channel(pin='P16', attn=ADC.ATTN_2_5DB)
 
-    # waking it up
-    # ... unlocking the pin
-    pin_activation_sensor.hold(False)
-    # ... set pin to High for 50 ms
-    pin_activation_sensor.value(True)
-    time.sleep_us(50)
+# deep sleep
+ds = DeepSleep()
+# ... uncomment the next two lines if you want to set up auto off
+# ds.set_min_voltage_limit(3.1)
+# ds.enable_auto_poweroff()
 
-    # reading 10 values
-    list_dist = list()
-    for i in range(11):
-        list_dist.append(apin() * 5) # Si ADC 12 bits -> 1.25
-        time.sleep_us(20000)
+# init Lorawan
+lora = LoRa(mode=LoRa.LORAWAN, adr=False, tx_retries=0, device_class=LoRa.CLASS_A)
 
-    # sorting them
-    list_dist.sort()
+# init uart
+uart1 = UART(1, baudrate=9600, timeout_chars=7)
 
-    # making it asleep by setting the pin to Low and locking its value
-    pin_activation_sensor.value(False)
-    pin_activation_sensor.hold(True)
-
-    # returning the median distance
-    return list_dist[5]
-
-def join_lora():
+def join_lora(force_join = False):
     '''Joining The Things Network '''
 
-    # init Lorawan
-    lora = LoRa(mode=LoRa.LORAWAN, public=1, adr=0, tx_retries=0, device_class=LoRa.CLASS_A)
-
-    # create an OTA authentication params
-    app_eui = binascii.unhexlify(config.APP_EUI.replace(' ',''))
-    app_key = binascii.unhexlify(config.APP_KEY.replace(' ',''))
+    # restore previous state
+    if not force_join:
+        lora.nvram_restore()
 
     # remove default channels
     for i in range(0, 72):
@@ -71,61 +61,131 @@ def join_lora():
     for i in range(0, 7):
         lora.add_channel(i, frequency=923300000 + i * 600000, dr_min=0, dr_max=3)
 
-    # join a network using OTAA
-    lora.join(activation=LoRa.OTAA, auth=(app_eui, app_key), timeout=0)
+    if not lora.has_joined() or force_join == True:
 
-    # wait until the module has joined the network
-    attempt = 0
-    while not lora.has_joined() and attempt < config.MAX_JOIN_ATTEMPT:
-        time.sleep(2.5)
-        attempt = attempt + 1
+        # create an OTA authentication params
+        app_eui = binascii.unhexlify(config.APP_EUI.replace(' ',''))
+        app_key = binascii.unhexlify(config.APP_KEY.replace(' ',''))
 
-    if lora.has_joined():
-        return True
+        # join a network using OTAA if not previously done
+        lora.join(activation=LoRa.OTAA, auth=(app_eui, app_key), timeout=0)
+
+        # wait until the module has joined the network
+        attempt = 0
+        while not lora.has_joined() and attempt < config.MAX_JOIN_ATTEMPT:
+            time.sleep(2.5)
+            attempt = attempt + 1
+
+        # saving the state
+        if not force_join:
+            lora.nvram_save()
+
+        # returning whether the join was successful
+        if lora.has_joined():
+            return True
+        else:
+            return False
+
     else:
-        return False
+        return True
 
-def get_battery_level():
-    '''Getting the battery level'''
-    # see https://forum.pycom.io/topic/226/lopy-adcs/6
-
-    # read the lopy schematic to see what is the voltage divider applied
-    # do not forget to use the proper attenuation
-    # then use adc to read the value on pin 16 and depending on the resolution
-    # i.e. the number of bits used by the ADC, compute the voltage of the
-    # LiPo battery.
-    # We might need to test to see what is the voltage of the battery at which
-    # it stops to work.
-
-    return 1000
-
-def send_LPP_over_lora(val, bat, port=2):
-   '''Sending the water and battery levels over LoraWan on a given port using Cayenne LPP format'''
+def send_LPP_over_lora(val, bat):
+   '''Sending water and battery levels over LoraWan using Cayenne LPP format'''
 
    # create a LoRa socket
    s = socket.socket(socket.AF_LORA, socket.SOCK_RAW)
 
    # set the LoRaWAN data rate
-   s.setsockopt(socket.SOL_LORA, socket.SO_DR, 4)
+   s.setsockopt(socket.SOL_LORA, socket.SO_DR, config.DATA_RATE)
 
-   # make the socket non blocking
-   s.setblocking(False)
+   # make the socket blocking
+   s.setblocking(True)
 
    # selecting port
-   s.bind(port)
+   s.bind(1)
 
    # creating LPP packets metadata
    # ... distance: channel and data type
    channel_dst = 1
-   data_dst    = 2
+   type_dst    = 2
+   data_dst    = int(val * 0.1)
+
    # ... battery: channel and data type
    channel_bat = 2
-   data_bat    = 2
+   type_bat    = 2
+   data_bat    = int(bat * 100)
 
-   # sending the packet
-   s.send(bytes([channel_dst, data_dst]) + struct.pack('>h', int(val * 0.1)) +
-          bytes([channel_bat, data_bat]) + struct.pack('>h', bat * 10))
-   time.sleep_us(250000)
+   # sending the sensor data
+   if not config.SEND_LOC:
+       s.send(bytes([channel_dst, type_dst]) + struct.pack('>h', data_dst) +
+              bytes([channel_bat, type_bat]) + struct.pack('>h', data_bat) )
+
+   # sending the location data
+   if config.SEND_LOC:
+
+       # ... gps: channel and data type
+       channel_gps = 3
+       type_gps    = 136
+       lat = int(config.LAT * 10000)
+       lon = int(config.LON * 10000)
+       alt = int(config.ALT * 100)
+
+       # ... select port 2
+       s.bind(2)
+
+       # ... sending
+       s.send(bytes([channel_gps, type_gps]) + struct.pack('>l', lat)[1:4] +
+                                               struct.pack('>l', lon)[1:4] +
+                                               struct.pack('>l', alt)[1:4])
+
+   # closing the socket and saving the LoRa state
+   s.close()
+   if not config.FORCE_JOIN:
+       lora.nvram_save()
+
+def read_distance():
+    '''Reading the distance using the ultrasonic sensor via serial port '''
+
+    # waking it up
+    # ... unlocking the pin
+    pin_activation_sensor.hold(False)
+    # ... set pin to High
+    pin_activation_sensor.value(True)
+
+    # waiting for the sensor to do a few readings
+    time.sleep_ms(500)
+
+    # reading the value from serial port (RS232)
+    dist_raw = uart1.readline()
+    dist = int(str(dist_raw).split('\\rR')[-2])
+
+    # making it asleep by setting the pin to Low and locking its value
+    pin_activation_sensor.value(False)
+    pin_activation_sensor.hold(True)
+
+    #return the distance in mm
+    return dist
+
+def read_battery_level():
+    '''Getting the battery level'''
+
+    # Reading the ADC level
+    list_volt = list()
+    for i in range(750):
+        list_volt.append(batt.value())
+    list_volt.sort()
+
+    # Convert the ADC reading to volt and battery capacity left in percent
+    volt = list_volt[749] * (1 / 0.327) * 1333.5 / 4095.0
+
+    pct = (volt - 3000.0) / (4077.9 - 3000.0)
+
+    # Set the lora battery level
+    lora_bat_level = int(pct * 254)
+    lora.set_battery_level(lora_bat_level)
+
+    # Return the battery capacity in range [0, 100]
+    return pct * 100
 
 '''
 ################################################################################
@@ -142,7 +202,10 @@ def send_LPP_over_lora(val, bat, port=2):
 '''
 
 distance = read_distance()
-battery  = get_battery_level()
-if join_lora():
-    send_LPP_over_lora(distance, battery)
-deepsleep(config.INT_SAMPLING)
+battery  = read_battery_level()
+if join_lora(config.FORCE_JOIN):
+    for i in range(config.N_TX):
+        send_LPP_over_lora(distance, battery)
+
+gc.collect()
+ds.go_to_sleep(config.INT_SAMPLING)

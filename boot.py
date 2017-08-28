@@ -3,16 +3,18 @@
 # Boot script
 #
 # Author:  J. Barthelemy
-# Version: 04 July 2017
+# Version: 07 August 2017
 
 from machine import UART
+from network import WLAN
 import pycom
 import os
-from network import WLAN
 
 # deactivate wifi
-wlan = WLAN()
-wlan.deinit()
+if pycom.wifi_on_boot:
+    wlan = WLAN()
+    wlan.deinit()
+    pycom.wifi_on_boot(False)
 
 # disabling the heartbeat
 pycom.heartbeat(False)
